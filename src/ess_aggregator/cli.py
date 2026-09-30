@@ -10,9 +10,13 @@ See README.md for a full walkthrough and the underlying business logic.
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
+import importlib.util
+import logging
 import sys
 
 from .config import DEFAULT_MIN_EFFECTIVE_N
+from .env import load_dotenv
 from .exceptions import ESSAggregatorError
 from .logging_utils import configure_logging
 from .output import write_csv
@@ -91,7 +95,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _log_pyess_provenance(logger: logging.Logger) -> None:
+    """Log which ``py-ess`` install is actually in use (version + location).
+
+    A stale or non-editable ``py-ess`` install silently shadowing a local
+    development checkout is a common source of confusing runtime errors
+    (e.g. an outdated version rejecting API requests). Logging this
+    up-front makes that kind of drift visible instead of a mystery.
+
+    Purely diagnostic: any failure to determine version/location is logged
+    and swallowed rather than aborting the run.
+    """
+    try:
+        version = importlib.metadata.version("py-ess")
+    except importlib.metadata.PackageNotFoundError:
+        logger.warning("py-ess version metadata not found (unusual for a working install).")
+        return
+
+    try:
+        spec = importlib.util.find_spec("pyess")
+        source_location = spec.origin if spec else "<unknown>"
+    except (ImportError, ValueError):
+        source_location = "<unknown>"
+    logger.info("Using py-ess %s (source: %s)", version, source_location)
+
+
 def main(argv: list[str] | None = None) -> int:
+    load_dotenv()
+
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
@@ -103,6 +134,7 @@ def main(argv: list[str] | None = None) -> int:
         # dependencies) installed.
         from pyess import ESS
 
+        _log_pyess_provenance(logger)
         ess_client = ESS()
         result_df = run_pipeline(
             ess_client,
@@ -118,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
     except ImportError:
         logger.error(
             "The 'pyess' package is required. Install it with: "
-            "pip install git+https://github.com/Oblivial/py-ess.git"
+            "pip install git+https://github.com/Oblivial/py-ess.git@v0.1.0b2"
         )
         return 2
     except Exception:  # noqa: BLE001 - top-level safety net, always log the traceback

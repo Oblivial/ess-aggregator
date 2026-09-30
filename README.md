@@ -42,14 +42,45 @@ Then run the command-line tool:
 ess-aggregate stflife happy --output results.csv
 ```
 
-The installation includes `py-ess`, which is installed directly from GitHub as
-configured in `pyproject.toml`. Data is fetched from the ESS API when the
-program runs.
+The installation includes `py-ess` `v0.1.0b2`, installed directly from GitHub
+as configured in `pyproject.toml`. Data is fetched from the ESS API when the
+program runs. Set your registered ESS API user ID via the `PYESS_USER_ID`
+environment variable (see `.env.example`); get one at
+https://ess.sikt.no/en/api.
 
 ## Development setup
 
-For development, create a virtual environment and install the package in
-editable mode together with the test dependencies:
+### Developing py-ess and ess-aggregator together
+
+If you're working on both `py-ess` and `ess-aggregator` at once (e.g. both
+checked out as sibling directories), plain `pip install .` is a trap: it
+silently pulls `py-ess` from the pinned git tag instead of using your local
+`py-ess` checkout, so edits to `py-ess` appear to have no effect. Use the
+provided setup script instead, which creates a shared venv and installs both
+packages in *editable* mode:
+
+```powershell
+.\scripts\dev-setup.ps1
+..\.venv\Scripts\Activate.ps1
+```
+
+Verify both resolved to your local checkouts (not a stale/pinned copy) with:
+
+```powershell
+pip show py-ess ess-aggregator
+```
+
+Look for `Editable project location` pointing at your checkouts. The CLI also
+logs the resolved `py-ess` version and source file on every run (visible with
+`--verbose` or in the log file), so drift is easy to spot later.
+
+Copy `.env.example` to `.env` and fill in your ESS user ID; it's loaded
+automatically (and is gitignored, so it never gets committed).
+
+### Developing ess-aggregator alone
+
+To work on `ess-aggregator` only, create a virtual environment and install
+the package in editable mode together with the test dependencies:
 
 ```powershell
 python -m venv .venv
