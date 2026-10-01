@@ -19,7 +19,7 @@ from .config import DEFAULT_MIN_EFFECTIVE_N
 from .env import load_dotenv
 from .exceptions import ESSAggregatorError
 from .logging_utils import configure_logging
-from .output import write_csv
+from .output import write_output
 from .pipeline import run_pipeline
 
 logger_name = "ess_aggregator"
@@ -73,7 +73,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--output",
         "-o",
         default="ess_aggregated.csv",
-        help="Path to the output CSV file (default: ess_aggregated.csv).",
+        help=(
+            "Path to the output file. CSV is the default; .parquet and .pq "
+            "extensions select Parquet automatically (default: ess_aggregated.csv)."
+        ),
+    )
+    parser.add_argument(
+        "--output-format",
+        choices=("csv", "parquet"),
+        default=None,
+        help="Explicit output format. By default, it is inferred from --output.",
+    )
+    parser.add_argument(
+        "--input-csv",
+        metavar="PATH",
+        help=(
+            "Load an existing local ESS CSV instead of downloading ESS rounds "
+            "from the API."
+        ),
+    )
+    parser.add_argument(
+        "--engine",
+        choices=("pandas", "polars"),
+        default="pandas",
+        help=(
+            "Dataframe engine for --input-csv. Polars requires the optional "
+            "dependency (install with pip install polars or from source with "
+            "pip install '.[polars]')."
+        ),
     )
     parser.add_argument(
         "--log-file",
@@ -125,6 +152,8 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    if args.engine == "polars" and not args.input_csv:
+        parser.error("--engine polars can only be used with --input-csv.")
 
     logger = configure_logging(args.log_file, verbose=args.verbose)
     logger.info("Starting ess_aggregator for variables=%s", args.variables)
@@ -135,7 +164,9 @@ def main(argv: list[str] | None = None) -> int:
         from pyess import ESS
 
         _log_pyess_provenance(logger)
-        ess_client = ESS()
+        # A local CSV needs the bundled codebook, but does not make ESS API
+        # requests; use a non-credential placeholder if no API ID is set.
+        ess_client = ESS(user_id="local-csv" if args.input_csv else None)
         result_df = run_pipeline(
             ess_client,
             variables=args.variables,
@@ -143,6 +174,8 @@ def main(argv: list[str] | None = None) -> int:
             countries=args.countries,
             min_effective_n=args.min_effective_n,
             recode_missing_values=args.recode_missing_values,
+            local_csv_path=args.input_csv,
+            engine=args.engine,
         )
     except ESSAggregatorError as exc:
         logger.error("Fatal error: %s", exc)
@@ -150,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
     except ImportError:
         logger.error(
             "The 'pyess' package is required. Install it with: "
-            "pip install git+https://github.com/Oblivial/py-ess.git@v0.1.0b2"
+            "pip install git+https://github.com/Oblivial/py-ess.git@v0.1.0b3"
         )
         return 2
     except Exception:  # noqa: BLE001 - top-level safety net, always log the traceback
@@ -161,7 +194,11 @@ def main(argv: list[str] | None = None) -> int:
         logger.warning("No rows were produced; nothing written to %s", args.output)
         return 1
 
-    written_path = write_csv(result_df, args.output)
+    try:
+        written_path = write_output(result_df, args.output, args.output_format)
+    except Exception:
+        logger.exception("Failed to write output file %s.", args.output)
+        return 1
     unreliable = int((~result_df["reliable"]).sum())
     logger.info(
         "Done. %d aggregate rows written to %s (%d flagged as low-N/unreliable).",

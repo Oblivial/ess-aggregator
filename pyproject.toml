@@ -12,10 +12,11 @@ license = { text = "MIT" }
 dependencies = [
     "pandas>=2.0",
     "numpy>=1.24",
-    "py-ess @ git+https://github.com/Oblivial/py-ess.git@v0.1.0b2",
+    "py-ess @ git+https://github.com/Oblivial/py-ess.git@v0.1.0b3",
 ]
 
 [project.optional-dependencies]
+polars = ["polars>=1.0"]
 dev = [
     "pytest>=7.4",
     "pytest-cov>=4.1",

@@ -12,7 +12,9 @@ fake/mocked ESS client (see tests/conftest.py).
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
@@ -43,7 +45,7 @@ class SupportsCodebook(Protocol):
 
 
 class SupportsDataset(Protocol):
-    dataframe: pd.DataFrame
+    dataframe: Any
 
 
 class SupportsESSClient(Protocol):
@@ -53,6 +55,10 @@ class SupportsESSClient(Protocol):
     codebook: SupportsCodebook
 
     def load(self, doi: str, **kwargs: Any) -> SupportsDataset: ...
+
+    def load_local_csv(
+        self, path: str | Path, variables: list[str], engine: str = "pandas"
+    ) -> SupportsDataset: ...
 
 
 @dataclass
@@ -80,11 +86,16 @@ class EssDataLoader:
         recode_missing_values: bool = True,
         weight_candidates: tuple[str, ...] = WEIGHT_CANDIDATES,
         year_candidates: tuple[str, ...] = YEAR_COLUMN_CANDIDATES,
+        local_csv_path: str | Path | None = None,
+        engine: str = "pandas",
     ):
         self.ess = ess_client
         self.recode_missing_values = recode_missing_values
         self.weight_candidates = weight_candidates
         self.year_candidates = year_candidates
+        self.local_csv_path = Path(local_csv_path) if local_csv_path is not None else None
+        self.engine = engine
+        self._local_dataframe: Any | None = None
         self.round_reports: list[LoadedRoundInfo] = []
 
     # -- round resolution -------------------------------------------------
@@ -189,6 +200,98 @@ class EssDataLoader:
             return codes.astype(str)
         return codes.map(lambda code: country_variable.label_for(code) or str(code))
 
+    @staticmethod
+    def _to_pandas(dataframe: Any) -> pd.DataFrame:
+        """Normalize py-ess pandas or Polars input for the aggregation code."""
+        if isinstance(dataframe, pd.DataFrame):
+            return dataframe
+        to_pandas = getattr(dataframe, "to_pandas", None)
+        if callable(to_pandas):
+            return to_pandas()
+        raise DataLoadError(
+            f"Unsupported dataframe type {type(dataframe).__name__!r}; "
+            "expected pandas or Polars."
+        )
+
+    def _requested_local_round_numbers(self, requested_rounds: list[str]) -> set[int]:
+        """Resolve round labels/DOIs to numeric ESS round values."""
+        numbers: set[int] = set()
+        for label in requested_rounds:
+            round_obj = self.ess.codebook.get_round(label)
+            if round_obj is None:
+                raise RoundNotFoundError(f"Unknown ESS round {label!r}.")
+            match = re.search(r"ess(\d+)", round_obj.doi, flags=re.IGNORECASE)
+            if match is None:
+                raise DataLoadError(
+                    f"Could not determine the numeric ESS round for {label!r} "
+                    f"from DOI {round_obj.doi!r}."
+                )
+            numbers.add(int(match.group(1)))
+        return numbers
+
+    def _prepare_long_dataframe(
+        self,
+        dataframe: Any,
+        variable_name: str,
+        countries: list[str] | None,
+        source_label: str,
+        requested_rounds: list[str] | None = None,
+    ) -> tuple[pd.DataFrame, str, str | None]:
+        """Validate and normalize one source dataset into the pipeline format."""
+        df = self._to_pandas(dataframe)
+        if variable_name not in df.columns:
+            raise DataLoadError(
+                f"{source_label} does not contain requested variable {variable_name!r}."
+            )
+        if COUNTRY_COLUMN not in df.columns:
+            raise DataLoadError(
+                f"{source_label} is missing the required {COUNTRY_COLUMN!r} column."
+            )
+        if requested_rounds:
+            if ROUND_COLUMN not in df.columns:
+                raise DataLoadError(
+                    f"Cannot apply requested rounds to {source_label}: the file has no "
+                    f"{ROUND_COLUMN!r} column."
+                )
+            requested_numbers = self._requested_local_round_numbers(requested_rounds)
+            round_numbers = pd.to_numeric(df[ROUND_COLUMN], errors="coerce")
+            df = df[round_numbers.isin(requested_numbers)]
+
+        weight, weight_col = self._resolve_weight(df)
+        year, year_col = self._resolve_year(df)
+        country = self._decode_country(df)
+        essround = (
+            pd.to_numeric(df[ROUND_COLUMN], errors="coerce")
+            if ROUND_COLUMN in df.columns
+            else pd.Series(np.nan, index=df.index)
+        )
+        long_df = pd.DataFrame(
+            {
+                "variable": variable_name,
+                "cntry_code": df[COUNTRY_COLUMN].astype(str),
+                "country": country,
+                "year": year,
+                "essround": essround,
+                "value": pd.to_numeric(df[variable_name], errors="coerce"),
+                "weight": weight,
+            }
+        )
+        countries_upper = {c.upper() for c in countries} if countries else None
+        if countries_upper is not None:
+            keep = long_df["cntry_code"].str.upper().isin(countries_upper) | long_df[
+                "country"
+            ].str.upper().isin(countries_upper)
+            long_df = long_df[keep]
+        logger.info(
+            "Loaded %d rows for variable=%r from %s (weight=%s, year_col=%s)",
+            len(long_df),
+            variable_name,
+            source_label,
+            weight_col,
+            year_col,
+        )
+        return long_df, weight_col, year_col
+
     # -- main entry point ---------------------------------------------------
     def load_variable_long(
         self,
@@ -204,9 +307,65 @@ class EssDataLoader:
         than aborting the whole run (partial-success error handling), so one
         broken round doesn't prevent aggregating the rest.
         """
+        if self.local_csv_path is not None:
+            source_label = f"local CSV {str(self.local_csv_path)!r}"
+            try:
+                if self._local_dataframe is None:
+                    dataset = self.ess.load_local_csv(
+                        self.local_csv_path,
+                        variables=[variable_name],
+                        engine=self.engine,
+                    )
+                    self._local_dataframe = dataset.dataframe
+                elif variable_name not in self._local_dataframe.columns:
+                    raise DataLoadError(
+                        f"{source_label} does not contain requested variable "
+                        f"{variable_name!r}."
+                    )
+                long_df, weight_col, year_col = self._prepare_long_dataframe(
+                    self._local_dataframe,
+                    variable_name,
+                    countries,
+                    source_label,
+                    requested_rounds,
+                )
+                self.round_reports.append(
+                    LoadedRoundInfo(
+                        round_label="local CSV",
+                        doi=str(self.local_csv_path),
+                        n_rows=len(long_df),
+                        weight_column=weight_col,
+                        year_column=year_col,
+                        ok=True,
+                    )
+                )
+                return long_df
+            except Exception as exc:
+                logger.error(
+                    "Failed to load variable=%r from %s: %s",
+                    variable_name,
+                    source_label,
+                    exc,
+                )
+                self.round_reports.append(
+                    LoadedRoundInfo(
+                        round_label="local CSV",
+                        doi=str(self.local_csv_path),
+                        n_rows=0,
+                        weight_column="",
+                        year_column=None,
+                        ok=False,
+                        message=str(exc),
+                    )
+                )
+                if isinstance(exc, (VariableNotFoundError, RoundNotFoundError, DataLoadError)):
+                    raise
+                raise DataLoadError(
+                    f"Could not load variable {variable_name!r} from {source_label}: {exc}"
+                ) from exc
+
         dois = self.resolve_rounds_for_variable(variable_name, requested_rounds)
         frames: list[pd.DataFrame] = []
-        countries_upper = {c.upper() for c in countries} if countries else None
 
         for doi in dois:
             round_obj = self.ess.codebook.get_datafile(doi) if hasattr(
@@ -215,44 +374,12 @@ class EssDataLoader:
             round_label = getattr(round_obj, "name", doi) if round_obj else doi
             try:
                 dataset = self.ess.load(doi, recode_missing_values=self.recode_missing_values)
-                df = dataset.dataframe
-                if variable_name not in df.columns:
-                    raise DataLoadError(
-                        f"Round {round_label} ({doi}) does not actually contain column "
-                        f"{variable_name!r} in its datafile (codebook/data mismatch)."
-                    )
-                if COUNTRY_COLUMN not in df.columns:
-                    raise DataLoadError(
-                        f"Round {round_label} ({doi}) is missing the required "
-                        f"{COUNTRY_COLUMN!r} column."
-                    )
-
-                weight, weight_col = self._resolve_weight(df)
-                year, year_col = self._resolve_year(df)
-                country = self._decode_country(df)
-                essround = (
-                    pd.to_numeric(df[ROUND_COLUMN], errors="coerce")
-                    if ROUND_COLUMN in df.columns
-                    else pd.Series(np.nan, index=df.index)
+                long_df, weight_col, year_col = self._prepare_long_dataframe(
+                    dataset.dataframe,
+                    variable_name,
+                    countries,
+                    f"Round {round_label} ({doi})",
                 )
-
-                long_df = pd.DataFrame(
-                    {
-                        "variable": variable_name,
-                        "cntry_code": df[COUNTRY_COLUMN].astype(str),
-                        "country": country,
-                        "year": year,
-                        "essround": essround,
-                        "value": pd.to_numeric(df[variable_name], errors="coerce"),
-                        "weight": weight,
-                    }
-                )
-
-                if countries_upper is not None:
-                    keep = long_df["cntry_code"].str.upper().isin(countries_upper) | long_df[
-                        "country"
-                    ].str.upper().isin(countries_upper)
-                    long_df = long_df[keep]
 
                 frames.append(long_df)
                 self.round_reports.append(
@@ -264,14 +391,6 @@ class EssDataLoader:
                         year_column=year_col,
                         ok=True,
                     )
-                )
-                logger.info(
-                    "Loaded %s rows for variable=%r round=%s (weight=%s, year_col=%s)",
-                    len(long_df),
-                    variable_name,
-                    round_label,
-                    weight_col,
-                    year_col,
                 )
             except Exception as exc:  # noqa: BLE001 - deliberately broad: one bad
                 # round must not abort the whole run; log and continue.

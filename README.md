@@ -2,8 +2,8 @@
 
 Aggregate individual-level microdata from the **European Social Survey (ESS)**
 into country-year, country-wide, and pooled European statistics. The resulting
-CSV can be joined to macroeconomic data for multilevel analyses, hierarchical
-linear models, and panel regressions.
+CSV or Parquet file can be joined to macroeconomic data for multilevel
+analyses, hierarchical linear models, and panel regressions.
 
 ESS data is loaded on demand through
 [`py-ess`](https://github.com/Oblivial/py-ess), which uses the official ESS API
@@ -42,7 +42,7 @@ Then run the command-line tool:
 ess-aggregate stflife happy --output results.csv
 ```
 
-The installation includes `py-ess` `v0.1.0b2`, installed directly from GitHub
+The installation includes `py-ess` `v0.1.0b3`, installed directly from GitHub
 as configured in `pyproject.toml`. Data is fetched from the ESS API when the
 program runs. Set your registered ESS API user ID via the `PYESS_USER_ID`
 environment variable (see `.env.example`); get one at
@@ -115,7 +115,10 @@ ess-aggregate stflife happy --output results.csv --log-file run.log
 | `--rounds` | Restrict processing to specific ESS rounds, for example `ESS9 ESS10 ESS11`. | Every round containing the variable |
 | `--countries` | Restrict processing to ISO alpha-2 country codes or country names, for example `DE FR` or `Germany France`. | All countries |
 | `--min-n` | Minimum effective sample size required to report distributional statistics. | `300` |
-| `--output`, `-o` | Output CSV path. | `ess_aggregated.csv` |
+| `--output`, `-o` | Output path. `.parquet` and `.pq` suffixes select Parquet automatically; otherwise CSV is used. | `ess_aggregated.csv` |
+| `--output-format` | Explicit output format: `csv` or `parquet`. | Inferred from `--output` |
+| `--input-csv` | Load a local ESS CSV instead of downloading rounds from the ESS API. | Download from the API |
+| `--engine` | Dataframe engine for `--input-csv`: `pandas` or `polars`. | `pandas` |
 | `--log-file` | Processing and error log path. | `ess_aggregator.log` |
 | `--no-recode-missing` | Do not ask the ESS API to recode designated missing values to system missing values. | Recode missing values |
 | `--verbose`, `-v` | Enable DEBUG-level console logging. The log file always uses DEBUG level. | INFO |
@@ -127,6 +130,40 @@ Show all options with:
 
 ```powershell
 ess-aggregate --help
+```
+
+### Load a local CSV with Polars
+
+Polars is optional. Install the extra with:
+
+```powershell
+python -m pip install ".[polars]"
+```
+
+Then pass the local ESS CSV and select the Polars engine:
+
+```powershell
+ess-aggregate stflife --input-csv "C:\data\ess.csv" --engine polars
+```
+
+The file must contain the requested variable and `cntry`; interview-year and
+weight columns are used when available. `py-ess` reads the local file with
+Polars, after which the data is converted to pandas for aggregation.
+`--rounds` can be used with a local CSV if it contains the `essround` column.
+Local-file mode does not download survey data from the ESS API.
+
+### Export Parquet
+
+Select Parquet automatically with a `.parquet` or `.pq` extension:
+
+```powershell
+ess-aggregate stflife --output "results.parquet"
+```
+
+Or explicitly select the output format:
+
+```powershell
+ess-aggregate stflife --output results.data --output-format parquet
 ```
 
 ## Output format
@@ -161,6 +198,9 @@ Each row in the output CSV contains:
 | `country_mean_over_years` | Mundlak between-country component, populated only for `country_year` rows. |
 | `within_country_deviation` | Mundlak within-country component, populated only for `country_year` rows. |
 | `warnings` | Semicolon-separated warnings, such as a low sample size. |
+
+For Parquet output, the `year` column is stored as a string because it
+contains both numeric years and the `All` pooling label.
 
 ## Calculations and business logic
 

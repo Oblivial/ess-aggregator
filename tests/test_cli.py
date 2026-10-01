@@ -28,6 +28,9 @@ class TestArgParser:
         assert args.countries is None
         assert args.min_effective_n == DEFAULT_MIN_EFFECTIVE_N
         assert args.output == "ess_aggregated.csv"
+        assert args.output_format is None
+        assert args.input_csv is None
+        assert args.engine == "pandas"
         assert args.recode_missing_values is True
 
     def test_multiple_variables_and_overrides(self):
@@ -46,6 +49,12 @@ class TestArgParser:
                 "500",
                 "--output",
                 "out.csv",
+                "--output-format",
+                "parquet",
+                "--input-csv",
+                "ess.csv",
+                "--engine",
+                "polars",
                 "--no-recode-missing",
             ]
         )
@@ -54,6 +63,9 @@ class TestArgParser:
         assert args.countries == ["DE", "FR"]
         assert args.min_effective_n == 500
         assert args.output == "out.csv"
+        assert args.output_format == "parquet"
+        assert args.input_csv == "ess.csv"
+        assert args.engine == "polars"
         assert args.recode_missing_values is False
 
 
@@ -100,6 +112,67 @@ class TestMainEndToEnd:
         )
         assert exit_code == 1
         assert not (tmp_path / "out.csv").exists()
+
+    def test_local_csv_with_polars_engine(self, mocked_pyess_module, tmp_path):
+        input_path = tmp_path / "ess.csv"
+        mocked_pyess_module._round_data["10.1/ess1"].to_csv(input_path, index=False)
+        output_path = tmp_path / "out.csv"
+
+        exit_code = main(
+            [
+                "stflife",
+                "--input-csv",
+                str(input_path),
+                "--engine",
+                "polars",
+                "--min-n",
+                "1",
+                "--output",
+                str(output_path),
+                "--log-file",
+                str(tmp_path / "run.log"),
+            ]
+        )
+
+        assert exit_code == 0
+        assert mocked_pyess_module.local_load_calls == [
+            (input_path, ["stflife"], "polars")
+        ]
+        assert "GermanyAll" in set(pd.read_csv(output_path)["unit"])
+
+    def test_parquet_format_is_inferred_from_extension(
+        self, mocked_pyess_module, tmp_path
+    ):
+        pytest.importorskip("pyarrow")
+        output_path = tmp_path / "out.parquet"
+
+        exit_code = main(
+            [
+                "stflife",
+                "--min-n",
+                "1",
+                "--output",
+                str(output_path),
+                "--log-file",
+                str(tmp_path / "run.log"),
+            ]
+        )
+
+        assert exit_code == 0
+        assert output_path.exists()
+        assert "GermanyAll" in set(pd.read_parquet(output_path)["unit"])
+
+    def test_polars_engine_requires_local_csv(self, tmp_path):
+        with pytest.raises(SystemExit):
+            main(
+                [
+                    "stflife",
+                    "--engine",
+                    "polars",
+                    "--log-file",
+                    str(tmp_path / "run.log"),
+                ]
+            )
 
     def test_missing_pyess_package_returns_exit_code_2(self, monkeypatch, tmp_path):
         monkeypatch.setitem(sys.modules, "pyess", None)  # forces ImportError on `from pyess import ESS`

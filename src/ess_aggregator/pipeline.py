@@ -206,6 +206,8 @@ def run_pipeline(
     countries: list[str] | None = None,
     min_effective_n: int = DEFAULT_MIN_EFFECTIVE_N,
     recode_missing_values: bool = True,
+    local_csv_path: str | None = None,
+    engine: str = "pandas",
 ) -> pd.DataFrame:
     """End-to-end pipeline: load every requested variable (across every
     applicable round) via ``py-ess``, then aggregate.
@@ -218,7 +220,12 @@ def run_pipeline(
     from .data_loader import EssDataLoader
     from .exceptions import ESSAggregatorError
 
-    loader = EssDataLoader(ess_client, recode_missing_values=recode_missing_values)
+    loader = EssDataLoader(
+        ess_client,
+        recode_missing_values=recode_missing_values,
+        local_csv_path=local_csv_path,
+        engine=engine,
+    )
     long_frames = []
     for variable in variables:
         try:

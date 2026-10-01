@@ -100,3 +100,60 @@ class TestLoadVariableLong:
         loader = EssDataLoader(fake_ess_two_rounds)
         with pytest.raises(DataLoadError):
             loader.load_variable_long("stflife")
+
+
+class TestLoadLocalCsv:
+    def test_loads_local_csv_through_pyess_client(self, fake_ess_two_rounds, tmp_path):
+        path = tmp_path / "ess.csv"
+        fake_ess_two_rounds._round_data["10.1/ess1"].to_csv(path, index=False)
+        loader = EssDataLoader(fake_ess_two_rounds, local_csv_path=path)
+
+        long_df = loader.load_variable_long("stflife")
+
+        assert len(long_df) == 80
+        assert fake_ess_two_rounds.local_load_calls == [(path, ["stflife"], "pandas")]
+        assert loader.round_reports[0].ok
+        assert loader.round_reports[0].weight_column == "anweight"
+
+    def test_uses_polars_engine_and_converts_frame(self, fake_ess_two_rounds, tmp_path):
+        path = tmp_path / "ess.csv"
+        fake_ess_two_rounds._round_data["10.1/ess1"].to_csv(path, index=False)
+        loader = EssDataLoader(fake_ess_two_rounds, local_csv_path=path, engine="polars")
+
+        long_df = loader.load_variable_long("stflife")
+
+        assert len(long_df) == 80
+        assert fake_ess_two_rounds.local_load_calls == [(path, ["stflife"], "polars")]
+        assert set(long_df["country"]) == {"Germany", "France"}
+
+    def test_reuses_local_frame_for_multiple_variables(self, fake_ess_two_rounds, tmp_path):
+        path = tmp_path / "ess.csv"
+        fake_ess_two_rounds._round_data["10.1/ess1"].to_csv(path, index=False)
+        loader = EssDataLoader(fake_ess_two_rounds, local_csv_path=path)
+
+        loader.load_variable_long("stflife")
+        loader.load_variable_long("cntry")
+
+        assert fake_ess_two_rounds.local_load_calls == [(path, ["stflife"], "pandas")]
+
+    def test_filters_local_csv_by_requested_round(self, fake_ess_two_rounds, tmp_path):
+        path = tmp_path / "ess.csv"
+        pd.concat(fake_ess_two_rounds._round_data.values(), ignore_index=True).to_csv(
+            path, index=False
+        )
+        loader = EssDataLoader(fake_ess_two_rounds, local_csv_path=path)
+
+        long_df = loader.load_variable_long("stflife", requested_rounds=["ESS1"])
+
+        assert len(long_df) == 80
+        assert set(long_df["essround"]) == {1}
+
+    def test_round_filter_requires_essround_column(self, fake_ess_two_rounds, tmp_path):
+        path = tmp_path / "ess.csv"
+        fake_ess_two_rounds._round_data["10.1/ess1"].drop(columns=["essround"]).to_csv(
+            path, index=False
+        )
+        loader = EssDataLoader(fake_ess_two_rounds, local_csv_path=path)
+
+        with pytest.raises(DataLoadError, match="essround"):
+            loader.load_variable_long("stflife", requested_rounds=["ESS1"])

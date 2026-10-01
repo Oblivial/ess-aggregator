@@ -8,6 +8,7 @@ without any real ESS API access.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -31,7 +32,15 @@ class FakeRound:
 
 @dataclass
 class FakeDataset:
-    dataframe: pd.DataFrame
+    dataframe: object
+
+
+@dataclass
+class FakePolarsFrame:
+    _dataframe: pd.DataFrame
+
+    def to_pandas(self):
+        return self._dataframe.copy()
 
 
 class FakeCodebook:
@@ -57,12 +66,24 @@ class FakeESS:
         self.codebook = codebook
         self._round_data = round_data
         self.load_calls: list[str] = []
+        self.local_load_calls: list[tuple[Path, list[str], str]] = []
 
     def load(self, doi, **kwargs):
         self.load_calls.append(doi)
         if doi not in self._round_data:
             raise RuntimeError(f"No fake data registered for DOI {doi!r}")
         return FakeDataset(dataframe=self._round_data[doi].copy())
+
+    def load_local_csv(self, path, variables=None, engine="pandas"):
+        path = Path(path)
+        self.local_load_calls.append((path, list(variables or []), engine))
+        dataframe = pd.read_csv(path)
+        missing = [name for name in (variables or []) if name not in dataframe.columns]
+        if missing:
+            raise KeyError(f"Missing variable(s): {', '.join(missing)}")
+        if engine == "polars":
+            return FakeDataset(dataframe=FakePolarsFrame(dataframe))
+        return FakeDataset(dataframe=dataframe)
 
 
 COUNTRY_LABELS = {"DE": "Germany", "FR": "France"}
