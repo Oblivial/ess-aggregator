@@ -67,7 +67,7 @@ class FakeESS:
         self.codebook = codebook
         self._round_data = round_data
         self.load_calls: list[str] = []
-        self.local_load_calls: list[tuple[Path, list[str], str]] = []
+        self.local_load_by_round_calls: list[tuple[Path, list[str], str]] = []
 
     def load(self, doi, **kwargs):
         self.load_calls.append(doi)
@@ -75,24 +75,55 @@ class FakeESS:
             raise RuntimeError(f"No fake data registered for DOI {doi!r}")
         return FakeDataset(dataframe=self._round_data[doi].copy())
 
-    def load_local_csv(self, path, variables=None, engine="pandas", recode_missing_values=True):
+    def load_local_csv_by_round(
+        self,
+        path,
+        variables=None,
+        engine="pandas",
+        recode_missing_values=True,
+        round_column="essround",
+    ):
+        """Mirrors real py-ess's ``load_local_csv_by_round``: split the file
+        by ``round_column``, map each round number to a DOI via the
+        codebook, drop columns that are entirely null *within that round's
+        raw (pre-recoding) rows*, and only then recode missing values -
+        exactly the ordering ``py-ess`` itself uses, so that a round whose
+        only observations happen to be legitimate missing-value codes isn't
+        mistaken for "this variable wasn't collected in this round"."""
         path = Path(path)
-        self.local_load_calls.append((path, list(variables or []), engine))
+        self.local_load_by_round_calls.append((path, list(variables or []), engine))
         dataframe = pd.read_csv(path)
         missing = [name for name in (variables or []) if name not in dataframe.columns]
         if missing:
             raise KeyError(f"Missing variable(s): {', '.join(missing)}")
-        if recode_missing_values:
-            for name in variables or []:
-                variable = self.codebook.get_variable(name)
-                if variable is None or not variable.missing_values:
-                    continue
-                dataframe[name] = dataframe[name].mask(
-                    dataframe[name].astype(str).isin(variable.missing_values)
-                )
-        if engine == "polars":
-            return FakeDataset(dataframe=FakePolarsFrame(dataframe))
-        return FakeDataset(dataframe=dataframe)
+        if round_column not in dataframe.columns:
+            raise KeyError(
+                f"ESS CSV {str(path)!r} is missing the round-identifying column "
+                f"{round_column!r}."
+            )
+        numbers = pd.to_numeric(dataframe[round_column], errors="coerce")
+        datasets: dict[str, FakeDataset] = {}
+        for number in sorted(numbers.dropna().unique()):
+            round_obj = self.codebook.get_round(f"ESS{int(number)}")
+            if round_obj is None:
+                continue
+            round_df = dataframe.loc[numbers == number].reset_index(drop=True)
+            round_df = round_df.dropna(axis=1, how="all")
+            if recode_missing_values:
+                for name in variables or round_df.columns:
+                    if name not in round_df.columns:
+                        continue
+                    variable = self.codebook.get_variable(name)
+                    if variable is None or not variable.missing_values:
+                        continue
+                    round_df[name] = round_df[name].mask(
+                        round_df[name].astype(str).isin(variable.missing_values)
+                    )
+            if engine == "polars":
+                datasets[round_obj.doi] = FakeDataset(dataframe=FakePolarsFrame(round_df))
+            else:
+                datasets[round_obj.doi] = FakeDataset(dataframe=round_df)
+        return datasets
 
 
 COUNTRY_LABELS = {"DE": "Germany", "FR": "France"}

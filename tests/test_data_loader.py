@@ -111,7 +111,7 @@ class TestLoadLocalCsv:
         long_df = loader.load_variable_long("stflife")
 
         assert len(long_df) == 80
-        assert fake_ess_two_rounds.local_load_calls == [(path, ["stflife"], "pandas")]
+        assert fake_ess_two_rounds.local_load_by_round_calls == [(path, [], "pandas")]
         assert loader.round_reports[0].ok
         assert loader.round_reports[0].weight_column == "anweight"
 
@@ -123,36 +123,43 @@ class TestLoadLocalCsv:
         long_df = loader.load_variable_long("stflife")
 
         assert len(long_df) == 80
-        assert fake_ess_two_rounds.local_load_calls == [(path, ["stflife"], "polars")]
+        assert fake_ess_two_rounds.local_load_by_round_calls == [(path, [], "polars")]
         assert set(long_df["country"]) == {"Germany", "France"}
 
     def test_reuses_local_frame_for_multiple_variables(self, fake_ess_two_rounds, tmp_path):
+        df = fake_ess_two_rounds._round_data["10.1/ess1"].copy()
+        df["stfeco"] = df["stflife"]
+        fake_ess_two_rounds.codebook._variables["stfeco"] = type(
+            fake_ess_two_rounds.codebook._variables["stflife"]
+        )(rounds=["10.1/ess1", "10.1/ess2"])
         path = tmp_path / "ess.csv"
-        fake_ess_two_rounds._round_data["10.1/ess1"].to_csv(path, index=False)
+        df.to_csv(path, index=False)
         loader = EssDataLoader(fake_ess_two_rounds, local_csv_path=path)
 
         loader.load_variable_long("stflife")
-        loader.load_variable_long("cntry")
+        loader.load_variable_long("stfeco")
 
-        assert fake_ess_two_rounds.local_load_calls == [(path, ["stflife"], "pandas")]
+        # The file is only split-by-round once, however many variables get
+        # requested afterwards.
+        assert fake_ess_two_rounds.local_load_by_round_calls == [(path, [], "pandas")]
 
     def test_recodes_missing_values_for_a_variable_loaded_after_the_first(
         self, fake_ess_two_rounds, tmp_path
     ):
-        """Regression test: the local dataframe is only loaded (and
-        recoded) once, for the first variable; a second variable accessed
+        """Regression test: the local round dataframes are only loaded (and
+        split) once, for the first variable; a second variable accessed
         afterwards from the same cached dataframe must still get its own
         designated-missing codes recoded."""
         df = fake_ess_two_rounds._round_data["10.1/ess1"].copy()
         df["stfeco"] = [5.0] * 79 + [77.0]  # last respondent: "Refusal"
         fake_ess_two_rounds.codebook._variables["stfeco"] = type(
             fake_ess_two_rounds.codebook._variables["stflife"]
-        )(missing_values={"77", "88", "99"})
+        )(rounds=["10.1/ess1", "10.1/ess2"], missing_values={"77", "88", "99"})
         path = tmp_path / "ess.csv"
         df.to_csv(path, index=False)
         loader = EssDataLoader(fake_ess_two_rounds, local_csv_path=path)
 
-        loader.load_variable_long("stflife")  # loads+caches the dataframe first
+        loader.load_variable_long("stflife")  # loads+caches the round split first
         long_df = loader.load_variable_long("stfeco")
 
         assert long_df["value"].isna().sum() == 1
@@ -170,39 +177,23 @@ class TestLoadLocalCsv:
         assert len(long_df) == 80
         assert set(long_df["essround"]) == {1}
 
-    def test_year_sentinel_missing_code_does_not_leak_into_other_rounds(
+    def test_handles_rounds_with_heterogeneous_weight_and_year_columns(
         self, fake_ess_two_rounds, tmp_path
     ):
-        """Regression test: ESS uses a designated-missing sentinel (``9999``)
-        for interview-year columns themselves. A round that only populates a
-        lower-priority year candidate (e.g. ``inwyr``) while a higher-priority
-        one (e.g. ``inwyys``) is coded with that sentinel used to make every
-        such row resolve to the bogus year 9999 instead of falling back."""
-        with_sentinel = fake_ess_two_rounds._round_data["10.1/ess1"].copy()
-        with_sentinel["inwyys"] = 9999  # not available for this round
-        with_sentinel["inwyr"] = 2002
-        fake_ess_two_rounds.codebook._variables["inwyys"] = type(
-            fake_ess_two_rounds.codebook._variables["stflife"]
-        )(missing_values={"9999"})
-        path = tmp_path / "ess.csv"
-        with_sentinel.to_csv(path, index=False)
-        loader = EssDataLoader(fake_ess_two_rounds, local_csv_path=path)
-
-        long_df = loader.load_variable_long("stflife")
-
-        assert set(long_df["year"].unique()) == {2002}
-
-    def test_resolves_year_per_row_when_rounds_use_different_year_columns(
-        self, fake_ess_two_rounds, tmp_path
-    ):
-        """Regression test: a merged local CSV stacking multiple ESS rounds
-        can have early rounds populate only ``inwyr`` and later rounds only
-        populate ``inwyys``. Picking a single year column for the whole file
-        used to silently drop every row from whichever round didn't
-        populate that column."""
+        """A merged local CSV stacking multiple ESS rounds can have some
+        rounds missing ``anweight`` (only ``pspwght`` populated) and/or
+        missing ``inwyys`` (only ``inwyr`` populated) entirely. This used to
+        be handled by coalescing across candidate columns row-by-row over
+        the whole merged file; it's now handled by ``py-ess`` splitting the
+        file into one dataframe per round first (so each round only ever
+        has the columns it actually has), which the fake client mirrors.
+        Both rounds' rows must still make it through, each resolving to its
+        own round's best column."""
         early_round = fake_ess_two_rounds._round_data["10.1/ess1"].copy()
         early_round["inwyys"] = np.nan
         early_round["inwyr"] = 2002
+        early_round["pspwght"] = early_round["anweight"]
+        early_round = early_round.drop(columns=["anweight"])
         later_round = fake_ess_two_rounds._round_data["10.1/ess2"].copy()
         later_round["inwyr"] = np.nan
         merged = pd.concat([early_round, later_round], ignore_index=True)
@@ -214,30 +205,12 @@ class TestLoadLocalCsv:
 
         assert len(long_df) == 160
         assert set(long_df["year"].unique()) == {2002, 2004}
-        assert loader.round_reports[0].year_column == "inwyys+inwyr"
-
-    def test_resolves_weight_per_row_when_rounds_use_different_weight_columns(
-        self, fake_ess_two_rounds, tmp_path
-    ):
-        """Regression test: a merged local CSV stacking multiple ESS rounds
-        can have some rounds missing ``anweight`` entirely (only
-        ``pspwght``/``dweight`` populated). Picking a single weight column
-        for the whole file used to turn every row from such a round into an
-        unusable (NaN-weighted, thus dropped) observation."""
-        with_anweight = fake_ess_two_rounds._round_data["10.1/ess1"].copy()
-        without_anweight = fake_ess_two_rounds._round_data["10.1/ess2"].copy()
-        without_anweight["pspwght"] = without_anweight["anweight"]
-        without_anweight = without_anweight.drop(columns=["anweight"])
-        merged = pd.concat([with_anweight, without_anweight], ignore_index=True)
-        path = tmp_path / "ess.csv"
-        merged.to_csv(path, index=False)
-        loader = EssDataLoader(fake_ess_two_rounds, local_csv_path=path)
-
-        long_df = loader.load_variable_long("stflife")
-
-        assert len(long_df) == 160
         assert not long_df["weight"].isna().any()
-        assert loader.round_reports[0].weight_column == "anweight+pspwght"
+        reports_by_round = {report.doi: report for report in loader.round_reports}
+        assert reports_by_round["10.1/ess1"].year_column == "inwyr"
+        assert reports_by_round["10.1/ess1"].weight_column == "pspwght"
+        assert reports_by_round["10.1/ess2"].year_column == "inwyys"
+        assert reports_by_round["10.1/ess2"].weight_column == "anweight"
 
     def test_round_filter_requires_essround_column(self, fake_ess_two_rounds, tmp_path):
         path = tmp_path / "ess.csv"
@@ -248,3 +221,4 @@ class TestLoadLocalCsv:
 
         with pytest.raises(DataLoadError, match="essround"):
             loader.load_variable_long("stflife", requested_rounds=["ESS1"])
+

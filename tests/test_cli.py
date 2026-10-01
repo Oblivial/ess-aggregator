@@ -135,8 +135,8 @@ class TestMainEndToEnd:
         )
 
         assert exit_code == 0
-        assert mocked_pyess_module.local_load_calls == [
-            (input_path, ["stflife"], "polars")
+        assert mocked_pyess_module.local_load_by_round_calls == [
+            (input_path, [], "polars")
         ]
         assert "GermanyAll" in set(pd.read_csv(output_path)["unit"])
 

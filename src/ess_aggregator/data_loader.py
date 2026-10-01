@@ -12,7 +12,6 @@ fake/mocked ESS client (see tests/conftest.py).
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -58,13 +57,13 @@ class SupportsESSClient(Protocol):
 
     def load(self, doi: str, **kwargs: Any) -> SupportsDataset: ...
 
-    def load_local_csv(
+    def load_local_csv_by_round(
         self,
         path: str | Path,
-        variables: list[str],
+        variables: list[str] | None = None,
         engine: str = "pandas",
         recode_missing_values: bool = True,
-    ) -> SupportsDataset: ...
+    ) -> dict[str, SupportsDataset]: ...
 
 
 @dataclass
@@ -101,12 +100,14 @@ class EssDataLoader:
         self.year_candidates = year_candidates
         self.local_csv_path = Path(local_csv_path) if local_csv_path is not None else None
         self.engine = engine
-        self._local_dataframe: Any | None = None
-        # Which local-CSV columns have already been missing-value-recoded.
-        # `_local_dataframe` is loaded (and recoded) once, for the first
-        # requested variable, then reused for every later `variable_name` -
-        # whose column therefore still needs recoding on first access.
-        self._recoded_local_columns: set[str] = set()
+        # Local CSVs are split into one dataframe per round (DOI) the first
+        # time any variable is requested, then reused for every later call -
+        # mirroring how the API naturally hands back one round per request.
+        self._local_round_dataframes: dict[str, pd.DataFrame] | None = None
+        # Which (doi, variable) columns have already been missing-value-recoded
+        # within `_local_round_dataframes`; recoding is applied lazily, per
+        # round and per variable, the first time that column is accessed.
+        self._recoded_local_columns: set[tuple[str, str]] = set()
         self.round_reports: list[LoadedRoundInfo] = []
 
     # -- round resolution -------------------------------------------------
@@ -157,66 +158,47 @@ class EssDataLoader:
 
     # -- weight / year column resolution -----------------------------------
     def _resolve_weight(self, df: pd.DataFrame) -> tuple[pd.Series, str]:
-        """Pick the best available weight for each row, coalescing across
-        candidate columns.
+        """Pick the best available weight column for this round.
 
         Prefers ``anweight`` (pre-combined design + population-size weight -
         see README.md "Gewichtung" for why this is safe to use for both
         single-country and pooled cross-country statistics), falling back to
         ``pspwght``/``dweight`` (standalone design weight, no population
-        scaling). A single merged local CSV can stack several ESS rounds that
-        each only populate a different one of these columns (e.g. ``anweight``
-        is entirely absent for some early rounds) - picking one column for the
-        whole dataframe would silently turn every row from such a round into
-        an unusable (NaN-weighted) observation, so each row instead falls
-        back, in ``self.weight_candidates`` order, to the first candidate
-        column that has a value for *that row*. Rows still unresolved after
-        that are derived as ``dweight_or_pspwght * pweight`` if the raw
-        components are present, and finally fall back to equal weights (1.0)
-        with a loud warning - equal weights silently make every downstream
-        statistic an *unweighted* one, which is why this is logged as a
-        warning rather than happening quietly.
+        scaling), and finally a derived ``dweight_or_pspwght * pweight`` if
+        the raw components are present. This only ever sees a single round's
+        data (``py-ess`` hands back one round per DOI, for both the API and
+        local-CSV sources - see ``load_local_csv_by_round``), so picking one
+        column for the whole frame is correct: every row in a round either
+        has the chosen column populated or none do. Falls back to equal
+        weights (1.0) with a loud warning if nothing usable is found - equal
+        weights silently make every downstream statistic an *unweighted*
+        one, which is why this is logged as a warning rather than happening
+        quietly.
         """
-        weight = pd.Series(np.nan, index=df.index, dtype="float64")
-        used_candidates: list[str] = []
         for candidate in self.weight_candidates:
-            if candidate not in df.columns:
-                continue
-            used_candidates.append(candidate)
-            weight = weight.where(weight.notna(), df[candidate].astype(float))
+            if candidate in df.columns:
+                return df[candidate].astype(float), candidate
 
         design_weight_col = next(
             (c for c in ("pspwght", "dweight") if c in df.columns), None
         )
-        if weight.isna().any() and (
-            design_weight_col is not None and POPULATION_WEIGHT_CANDIDATE in df.columns
-        ):
-            derived = df[design_weight_col].astype(float) * df[POPULATION_WEIGHT_CANDIDATE].astype(
+        if design_weight_col is not None and POPULATION_WEIGHT_CANDIDATE in df.columns:
+            derived_name = f"{design_weight_col}*{POPULATION_WEIGHT_CANDIDATE}"
+            logger.warning(
+                "No pre-combined weight column found; derived %s from its components.",
+                derived_name,
+            )
+            weight = df[design_weight_col].astype(float) * df[POPULATION_WEIGHT_CANDIDATE].astype(
                 float
             )
-            derived_name = f"{design_weight_col}*{POPULATION_WEIGHT_CANDIDATE}"
-            if weight.isna().all():
-                logger.warning(
-                    "No pre-combined weight column found; derived %s from its components.",
-                    derived_name,
-                )
-            weight = weight.where(weight.notna(), derived)
-            used_candidates.append(derived_name)
+            return weight, derived_name
 
-        if weight.isna().any():
-            logger.warning(
-                "No ESS design-weight column found for %d row(s) (looked for %s); falling "
-                "back to unweighted (weight=1.0) for those rows. Results will not correct "
-                "for sampling design there.",
-                int(weight.isna().sum()),
-                self.weight_candidates,
-            )
-            weight = weight.fillna(1.0)
-            used_candidates.append("none (unweighted)")
-
-        if not used_candidates:
-            return weight, "none (unweighted)"
-        return weight, "+".join(dict.fromkeys(used_candidates))
+        logger.warning(
+            "No ESS design-weight column found (looked for %s); falling back to "
+            "unweighted (weight=1.0). Results will not correct for sampling design.",
+            self.weight_candidates,
+        )
+        return pd.Series(1.0, index=df.index, dtype="float64"), "none (unweighted)"
 
     def _missing_codes_for(self, column: str) -> set[float]:
         """Numeric designated-missing codes (e.g. ``9999``) registered in the
@@ -233,39 +215,30 @@ class EssDataLoader:
         return codes
 
     def _resolve_year(self, df: pd.DataFrame) -> tuple[pd.Series, str | None]:
-        """Resolve each row's interview year, coalescing across candidate columns.
+        """Resolve this round's interview year from the best available
+        candidate column.
 
-        A single merged local CSV can stack several ESS rounds that each only
-        populate a different one of the candidate columns (e.g. early rounds
-        use ``inwyr`` while later ones use ``inwyys``). Picking a single
-        column for the whole dataframe would silently drop every row whose
-        round doesn't populate that column, so instead each row falls back,
-        in ``self.year_candidates`` order, to the first candidate column that
-        has a value for *that row*. Each candidate's own designated-missing
-        codes (e.g. ESS uses ``9999`` for "not applicable"/"not available"
-        across all three year columns) are recoded to NaN first, so a round
-        that lacks one candidate doesn't poison another round's rows with a
-        bogus sentinel "year".
+        Different ESS rounds use different year columns (e.g. early rounds
+        use ``inwyr`` while later ones use ``inwyys``), but - as with
+        ``_resolve_weight`` - this only ever sees a single round's data, so
+        picking the first candidate column present is correct. ESS uses a
+        designated-missing sentinel (e.g. ``9999``) for "not
+        applicable"/"not available" in year columns themselves, so the
+        chosen column's own designated-missing codes are recoded to NaN
+        before being returned.
         """
-        year = pd.Series(np.nan, index=df.index, dtype="float64")
-        used_candidates: list[str] = []
         for candidate in self.year_candidates:
             if candidate not in df.columns:
                 continue
-            used_candidates.append(candidate)
-            candidate_values = pd.to_numeric(df[candidate], errors="coerce")
-            candidate_values = candidate_values.mask(
-                candidate_values.isin(self._missing_codes_for(candidate))
-            )
-            year = year.where(year.notna(), candidate_values)
-        if not used_candidates:
-            logger.warning(
-                "No interview-year column found (looked for %s); year-level aggregation is "
-                "unavailable for this round.",
-                self.year_candidates,
-            )
-            return year, None
-        return year, "+".join(used_candidates)
+            year = pd.to_numeric(df[candidate], errors="coerce")
+            year = year.mask(year.isin(self._missing_codes_for(candidate)))
+            return year, candidate
+        logger.warning(
+            "None of the candidate year columns %s were present for this round; year is "
+            "unavailable for this round.",
+            self.year_candidates,
+        )
+        return pd.Series(np.nan, index=df.index, dtype="float64"), None
 
     def _decode_country(self, df: pd.DataFrame) -> pd.Series:
         country_variable = self.ess.codebook.get_variable(COUNTRY_COLUMN)
@@ -287,31 +260,20 @@ class EssDataLoader:
             "expected pandas or Polars."
         )
 
-    def _requested_local_round_numbers(self, requested_rounds: list[str]) -> set[int]:
-        """Resolve round labels/DOIs to numeric ESS round values."""
-        numbers: set[int] = set()
-        for label in requested_rounds:
-            round_obj = self.ess.codebook.get_round(label)
-            if round_obj is None:
-                raise RoundNotFoundError(f"Unknown ESS round {label!r}.")
-            match = re.search(r"ess(\d+)", round_obj.doi, flags=re.IGNORECASE)
-            if match is None:
-                raise DataLoadError(
-                    f"Could not determine the numeric ESS round for {label!r} "
-                    f"from DOI {round_obj.doi!r}."
-                )
-            numbers.add(int(match.group(1)))
-        return numbers
-
     def _prepare_long_dataframe(
         self,
         dataframe: Any,
         variable_name: str,
         countries: list[str] | None,
         source_label: str,
-        requested_rounds: list[str] | None = None,
     ) -> tuple[pd.DataFrame, str, str | None]:
-        """Validate and normalize one source dataset into the pipeline format."""
+        """Validate and normalize one round's dataset into the pipeline
+        format. Only ever receives a single round's data - ``py-ess`` hands
+        back one dataframe per DOI for both the API and local-CSV sources
+        (see ``load_local_csv_by_round``) - so no round filtering happens
+        here; ``resolve_rounds_for_variable`` already restricted which
+        DOIs/rounds are loaded in the first place.
+        """
         df = self._to_pandas(dataframe)
         if variable_name not in df.columns:
             raise DataLoadError(
@@ -321,15 +283,6 @@ class EssDataLoader:
             raise DataLoadError(
                 f"{source_label} is missing the required {COUNTRY_COLUMN!r} column."
             )
-        if requested_rounds:
-            if ROUND_COLUMN not in df.columns:
-                raise DataLoadError(
-                    f"Cannot apply requested rounds to {source_label}: the file has no "
-                    f"{ROUND_COLUMN!r} column."
-                )
-            requested_numbers = self._requested_local_round_numbers(requested_rounds)
-            round_numbers = pd.to_numeric(df[ROUND_COLUMN], errors="coerce")
-            df = df[round_numbers.isin(requested_numbers)]
 
         weight, weight_col = self._resolve_weight(df)
         year, year_col = self._resolve_year(df)
@@ -377,83 +330,22 @@ class EssDataLoader:
         single tidy long DataFrame with columns
         ``["variable", "cntry_code", "country", "year", "essround", "value", "weight"]``.
 
-        Rounds that fail to download/parse are logged and skipped rather
-        than aborting the whole run (partial-success error handling), so one
-        broken round doesn't prevent aggregating the rest.
+        Works identically whether ``self.local_csv_path`` is set or not: in
+        both cases this loops once per round DOI and loads exactly that
+        round's data via ``_load_round_dataframe`` - for the API that's a
+        direct per-round request, for a local CSV it's a lazily-cached,
+        already-split-by-round dataframe (see ``py-ess``'s
+        ``load_local_csv_by_round``). Rounds that fail to load/parse are
+        logged and skipped rather than aborting the whole run
+        (partial-success error handling), so one broken round doesn't
+        prevent aggregating the rest.
         """
-        if self.local_csv_path is not None:
-            source_label = f"local CSV {str(self.local_csv_path)!r}"
-            try:
-                if self._local_dataframe is None:
-                    dataset = self.ess.load_local_csv(
-                        self.local_csv_path,
-                        variables=[variable_name],
-                        engine=self.engine,
-                        recode_missing_values=self.recode_missing_values,
-                    )
-                    self._local_dataframe = dataset.dataframe
-                    self._recoded_local_columns.add(variable_name)
-                elif variable_name not in self._local_dataframe.columns:
-                    raise DataLoadError(
-                        f"{source_label} does not contain requested variable "
-                        f"{variable_name!r}."
-                    )
-                elif (
-                    self.recode_missing_values
-                    and variable_name not in self._recoded_local_columns
-                ):
-                    # The dataframe was already loaded (and recoded) for an
-                    # earlier variable; this one's column hasn't been
-                    # recoded yet.
-                    self._local_dataframe = recode_missing_values(
-                        self._local_dataframe,
-                        self.ess.codebook,
-                        columns=[variable_name],
-                    )
-                    self._recoded_local_columns.add(variable_name)
-                long_df, weight_col, year_col = self._prepare_long_dataframe(
-                    self._local_dataframe,
-                    variable_name,
-                    countries,
-                    source_label,
-                    requested_rounds,
-                )
-                self.round_reports.append(
-                    LoadedRoundInfo(
-                        round_label="local CSV",
-                        doi=str(self.local_csv_path),
-                        n_rows=len(long_df),
-                        weight_column=weight_col,
-                        year_column=year_col,
-                        ok=True,
-                    )
-                )
-                return long_df
-            except Exception as exc:
-                logger.error(
-                    "Failed to load variable=%r from %s: %s",
-                    variable_name,
-                    source_label,
-                    exc,
-                )
-                self.round_reports.append(
-                    LoadedRoundInfo(
-                        round_label="local CSV",
-                        doi=str(self.local_csv_path),
-                        n_rows=0,
-                        weight_column="",
-                        year_column=None,
-                        ok=False,
-                        message=str(exc),
-                    )
-                )
-                if isinstance(exc, (VariableNotFoundError, RoundNotFoundError, DataLoadError)):
-                    raise
-                raise DataLoadError(
-                    f"Could not load variable {variable_name!r} from {source_label}: {exc}"
-                ) from exc
-
         dois = self.resolve_rounds_for_variable(variable_name, requested_rounds)
+        if self.local_csv_path is not None:
+            # Fail fast on file-level structural problems (e.g. a missing
+            # round-identifying column affects every round identically, so
+            # there's no point retrying it once per round below).
+            self._ensure_local_round_dataframes()
         frames: list[pd.DataFrame] = []
 
         for doi in dois:
@@ -461,13 +353,18 @@ class EssDataLoader:
                 self.ess.codebook, "get_datafile"
             ) else None
             round_label = getattr(round_obj, "name", doi) if round_obj else doi
+            source_label = (
+                f"local CSV {str(self.local_csv_path)!r} (round {round_label})"
+                if self.local_csv_path is not None
+                else f"Round {round_label} ({doi})"
+            )
             try:
-                dataset = self.ess.load(doi, recode_missing_values=self.recode_missing_values)
+                dataframe = self._load_round_dataframe(doi, variable_name)
                 long_df, weight_col, year_col = self._prepare_long_dataframe(
-                    dataset.dataframe,
+                    dataframe,
                     variable_name,
                     countries,
-                    f"Round {round_label} ({doi})",
+                    source_label,
                 )
 
                 frames.append(long_df)
@@ -507,3 +404,56 @@ class EssDataLoader:
                 f"Could not load any data at all for variable {variable_name!r}."
             )
         return pd.concat(frames, ignore_index=True)
+
+    # -- per-round dataframe loading (API or local CSV) ----------------------
+    def _load_round_dataframe(self, doi: str, variable_name: str) -> pd.DataFrame:
+        """Return one round's dataframe, dispatching to the API or the
+        cached local-CSV round split depending on ``self.local_csv_path``."""
+        if self.local_csv_path is not None:
+            return self._load_local_round_dataframe(doi, variable_name)
+        dataset = self.ess.load(doi, recode_missing_values=self.recode_missing_values)
+        return self._to_pandas(dataset.dataframe)
+
+    def _ensure_local_round_dataframes(self) -> dict[str, pd.DataFrame]:
+        """Lazily split the local CSV into one dataframe per round (DOI),
+        caching the result across calls so the (potentially huge) file is
+        only read once, regardless of how many variables are requested.
+        Missing-value recoding is deliberately *not* done here - it happens
+        lazily, per round and per variable, in ``_load_local_round_dataframe``.
+        """
+        if self._local_round_dataframes is None:
+            try:
+                datasets = self.ess.load_local_csv_by_round(
+                    self.local_csv_path,
+                    engine=self.engine,
+                    recode_missing_values=False,
+                )
+            except DataLoadError:
+                raise
+            except Exception as exc:
+                raise DataLoadError(
+                    f"Could not load local CSV {str(self.local_csv_path)!r}: {exc}"
+                ) from exc
+            self._local_round_dataframes = {
+                doi: self._to_pandas(dataset.dataframe) for doi, dataset in datasets.items()
+            }
+        return self._local_round_dataframes
+
+    def _load_local_round_dataframe(self, doi: str, variable_name: str) -> pd.DataFrame:
+        source_label = f"local CSV {str(self.local_csv_path)!r}"
+        round_dataframes = self._ensure_local_round_dataframes()
+        if doi not in round_dataframes:
+            raise DataLoadError(f"{source_label} has no data for round {doi!r}.")
+        df = round_dataframes[doi]
+        if variable_name not in df.columns:
+            raise DataLoadError(
+                f"{source_label} does not contain requested variable {variable_name!r} "
+                f"for round {doi!r}."
+            )
+        cache_key = (doi, variable_name)
+        if self.recode_missing_values and cache_key not in self._recoded_local_columns:
+            df = recode_missing_values(df, self.ess.codebook, columns=[variable_name])
+            round_dataframes[doi] = df
+            self._recoded_local_columns.add(cache_key)
+        return df
+
