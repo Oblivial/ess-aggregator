@@ -19,6 +19,7 @@ import pytest
 class FakeVariable:
     rounds: list[str] = field(default_factory=list)
     _labels: dict[str, str] = field(default_factory=dict)
+    missing_values: set[str] = field(default_factory=set)
 
     def label_for(self, value):
         return self._labels.get(str(value))
@@ -74,13 +75,21 @@ class FakeESS:
             raise RuntimeError(f"No fake data registered for DOI {doi!r}")
         return FakeDataset(dataframe=self._round_data[doi].copy())
 
-    def load_local_csv(self, path, variables=None, engine="pandas"):
+    def load_local_csv(self, path, variables=None, engine="pandas", recode_missing_values=True):
         path = Path(path)
         self.local_load_calls.append((path, list(variables or []), engine))
         dataframe = pd.read_csv(path)
         missing = [name for name in (variables or []) if name not in dataframe.columns]
         if missing:
             raise KeyError(f"Missing variable(s): {', '.join(missing)}")
+        if recode_missing_values:
+            for name in variables or []:
+                variable = self.codebook.get_variable(name)
+                if variable is None or not variable.missing_values:
+                    continue
+                dataframe[name] = dataframe[name].mask(
+                    dataframe[name].astype(str).isin(variable.missing_values)
+                )
         if engine == "polars":
             return FakeDataset(dataframe=FakePolarsFrame(dataframe))
         return FakeDataset(dataframe=dataframe)

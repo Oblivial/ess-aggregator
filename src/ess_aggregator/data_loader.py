@@ -19,6 +19,7 @@ from typing import Any, Protocol
 
 import numpy as np
 import pandas as pd
+from pyess import recode_missing_values
 
 from .config import (
     COUNTRY_COLUMN,
@@ -34,6 +35,7 @@ logger = logging.getLogger("ess_aggregator")
 
 class SupportsCodebookVariable(Protocol):
     rounds: list[str]
+    missing_values: set[str]
 
     def label_for(self, value: Any) -> str | None: ...
 
@@ -57,7 +59,11 @@ class SupportsESSClient(Protocol):
     def load(self, doi: str, **kwargs: Any) -> SupportsDataset: ...
 
     def load_local_csv(
-        self, path: str | Path, variables: list[str], engine: str = "pandas"
+        self,
+        path: str | Path,
+        variables: list[str],
+        engine: str = "pandas",
+        recode_missing_values: bool = True,
     ) -> SupportsDataset: ...
 
 
@@ -96,6 +102,11 @@ class EssDataLoader:
         self.local_csv_path = Path(local_csv_path) if local_csv_path is not None else None
         self.engine = engine
         self._local_dataframe: Any | None = None
+        # Which local-CSV columns have already been missing-value-recoded.
+        # `_local_dataframe` is loaded (and recoded) once, for the first
+        # requested variable, then reused for every later `variable_name` -
+        # whose column therefore still needs recoding on first access.
+        self._recoded_local_columns: set[str] = set()
         self.round_reports: list[LoadedRoundInfo] = []
 
     # -- round resolution -------------------------------------------------
@@ -315,13 +326,28 @@ class EssDataLoader:
                         self.local_csv_path,
                         variables=[variable_name],
                         engine=self.engine,
+                        recode_missing_values=self.recode_missing_values,
                     )
                     self._local_dataframe = dataset.dataframe
+                    self._recoded_local_columns.add(variable_name)
                 elif variable_name not in self._local_dataframe.columns:
                     raise DataLoadError(
                         f"{source_label} does not contain requested variable "
                         f"{variable_name!r}."
                     )
+                elif (
+                    self.recode_missing_values
+                    and variable_name not in self._recoded_local_columns
+                ):
+                    # The dataframe was already loaded (and recoded) for an
+                    # earlier variable; this one's column hasn't been
+                    # recoded yet.
+                    self._local_dataframe = recode_missing_values(
+                        self._local_dataframe,
+                        self.ess.codebook,
+                        columns=[variable_name],
+                    )
+                    self._recoded_local_columns.add(variable_name)
                 long_df, weight_col, year_col = self._prepare_long_dataframe(
                     self._local_dataframe,
                     variable_name,

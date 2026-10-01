@@ -136,6 +136,28 @@ class TestLoadLocalCsv:
 
         assert fake_ess_two_rounds.local_load_calls == [(path, ["stflife"], "pandas")]
 
+    def test_recodes_missing_values_for_a_variable_loaded_after_the_first(
+        self, fake_ess_two_rounds, tmp_path
+    ):
+        """Regression test: the local dataframe is only loaded (and
+        recoded) once, for the first variable; a second variable accessed
+        afterwards from the same cached dataframe must still get its own
+        designated-missing codes recoded."""
+        df = fake_ess_two_rounds._round_data["10.1/ess1"].copy()
+        df["stfeco"] = [5.0] * 79 + [77.0]  # last respondent: "Refusal"
+        fake_ess_two_rounds.codebook._variables["stfeco"] = type(
+            fake_ess_two_rounds.codebook._variables["stflife"]
+        )(missing_values={"77", "88", "99"})
+        path = tmp_path / "ess.csv"
+        df.to_csv(path, index=False)
+        loader = EssDataLoader(fake_ess_two_rounds, local_csv_path=path)
+
+        loader.load_variable_long("stflife")  # loads+caches the dataframe first
+        long_df = loader.load_variable_long("stfeco")
+
+        assert long_df["value"].isna().sum() == 1
+        assert long_df["value"].max() == 5.0
+
     def test_filters_local_csv_by_requested_round(self, fake_ess_two_rounds, tmp_path):
         path = tmp_path / "ess.csv"
         pd.concat(fake_ess_two_rounds._round_data.values(), ignore_index=True).to_csv(
