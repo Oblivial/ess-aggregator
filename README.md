@@ -42,6 +42,23 @@ the requested variable and `cntry`; interview-year and weight columns are
 used when present. Local input does not access the ESS API. To filter a local
 file by round, it must also include `essround`.
 
+## CLI reference
+
+| Flag | Description | Default |
+|---|---|---|
+| `VARIABLE` | One or more ESS variable names to aggregate. | Required |
+| `--rounds ROUND [...]` | Restrict to specified ESS rounds. | All rounds containing each variable |
+| `--countries COUNTRY [...]` | Filter by ISO alpha-2 country codes or country names. | All countries |
+| `--min-n N` | Minimum effective sample size for distributional statistics. | `300` |
+| `--output`, `-o PATH` | Output path. `.parquet`/`.pq` selects Parquet; otherwise CSV. | `ess_aggregated.csv` |
+| `--output-format {csv,parquet}` | Explicitly set the output format. | Inferred from file extension |
+| `--input-csv PATH` | Read a local ESS CSV instead of downloading from the API. | ESS API |
+| `--engine {pandas,polars}` | Dataframe engine for local CSV input. Polars is optional. | `pandas` |
+| `--log-file PATH` | Processing and error log path. | `ess_aggregator.log` |
+| `--no-recode-missing` | Disable ESS API recoding of designated missing values. | Recoding enabled |
+| `--verbose`, `-v` | Enable DEBUG-level console logging. | INFO |
+| `--help`, `-h` | Show command help and exit. | — |
+
 ## Output at a glance
 
 Each variable produces country-year rows and pooled rows:
