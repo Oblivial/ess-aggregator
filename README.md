@@ -11,21 +11,25 @@ and provides codebook metadata such as variable labels and round membership.
 
 ## Contents
 
-- [Installation](#installation)
-- [Development setup](#development-setup)
-- [Command-line usage](#command-line-usage)
-- [Output format](#output-format)
-- [Calculations and business logic](#calculations-and-business-logic)
-  - [Weights](#weights)
-  - [Sample size and reliability threshold](#sample-size-and-reliability-threshold)
-  - [Central tendency: mean, median, and mode](#central-tendency-mean-median-and-mode)
-  - [Dispersion: standard deviation and IQR](#dispersion-standard-deviation-and-iqr)
-  - [Inequality: Gini, percentiles, quantile ratio, and Palma ratio](#inequality-gini-percentiles-quantile-ratio-and-palma-ratio)
-  - [Mundlak / zero-centering transformation](#mundlak--zero-centering-transformation)
-  - [Country and year identification](#country-and-year-identification)
-- [Error handling and logging](#error-handling-and-logging)
-- [Tests](#tests)
-- [Project structure](#project-structure)
+- [ess-aggregator](#ess-aggregator)
+  - [Contents](#contents)
+  - [Installation](#installation)
+  - [Development setup](#development-setup)
+  - [Command-line usage](#command-line-usage)
+    - [Load a local CSV with Polars](#load-a-local-csv-with-polars)
+    - [Export Parquet](#export-parquet)
+  - [Output format](#output-format)
+  - [Calculations and business logic](#calculations-and-business-logic)
+    - [Weights](#weights)
+    - [Sample size and reliability threshold](#sample-size-and-reliability-threshold)
+    - [Central tendency: mean, median, and mode](#central-tendency-mean-median-and-mode)
+    - [Dispersion: standard deviation and IQR](#dispersion-standard-deviation-and-iqr)
+    - [Inequality: Gini, percentiles, quantile ratio, and Palma ratio](#inequality-gini-percentiles-quantile-ratio-and-palma-ratio)
+    - [Mundlak / zero-centering transformation](#mundlak--zero-centering-transformation)
+    - [Country and year identification](#country-and-year-identification)
+  - [Error handling and logging](#error-handling-and-logging)
+  - [Tests](#tests)
+  - [Project structure](#project-structure)
 
 ## Installation
 
@@ -49,38 +53,7 @@ environment variable (see `.env.example`); get one at
 https://ess.sikt.no/en/api.
 
 ## Development setup
-
-### Developing py-ess and ess-aggregator together
-
-If you're working on both `py-ess` and `ess-aggregator` at once (e.g. both
-checked out as sibling directories), plain `pip install .` is a trap: it
-silently pulls `py-ess` from the pinned git tag instead of using your local
-`py-ess` checkout, so edits to `py-ess` appear to have no effect. Use the
-provided setup script instead, which creates a shared venv and installs both
-packages in *editable* mode:
-
-```powershell
-.\scripts\dev-setup.ps1
-..\.venv\Scripts\Activate.ps1
-```
-
-Verify both resolved to your local checkouts (not a stale/pinned copy) with:
-
-```powershell
-pip show py-ess ess-aggregator
-```
-
-Look for `Editable project location` pointing at your checkouts. The CLI also
-logs the resolved `py-ess` version and source file on every run (visible with
-`--verbose` or in the log file), so drift is easy to spot later.
-
-Copy `.env.example` to `.env` and fill in your ESS user ID; it's loaded
-automatically (and is gitignored, so it never gets committed).
-
-### Developing ess-aggregator alone
-
-To work on `ess-aggregator` only, create a virtual environment and install
-the package in editable mode together with the test dependencies:
+Create a virtual environment and install the package in editable mode together with the test dependencies:
 
 ```powershell
 python -m venv .venv
