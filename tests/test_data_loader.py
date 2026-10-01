@@ -170,6 +170,75 @@ class TestLoadLocalCsv:
         assert len(long_df) == 80
         assert set(long_df["essround"]) == {1}
 
+    def test_year_sentinel_missing_code_does_not_leak_into_other_rounds(
+        self, fake_ess_two_rounds, tmp_path
+    ):
+        """Regression test: ESS uses a designated-missing sentinel (``9999``)
+        for interview-year columns themselves. A round that only populates a
+        lower-priority year candidate (e.g. ``inwyr``) while a higher-priority
+        one (e.g. ``inwyys``) is coded with that sentinel used to make every
+        such row resolve to the bogus year 9999 instead of falling back."""
+        with_sentinel = fake_ess_two_rounds._round_data["10.1/ess1"].copy()
+        with_sentinel["inwyys"] = 9999  # not available for this round
+        with_sentinel["inwyr"] = 2002
+        fake_ess_two_rounds.codebook._variables["inwyys"] = type(
+            fake_ess_two_rounds.codebook._variables["stflife"]
+        )(missing_values={"9999"})
+        path = tmp_path / "ess.csv"
+        with_sentinel.to_csv(path, index=False)
+        loader = EssDataLoader(fake_ess_two_rounds, local_csv_path=path)
+
+        long_df = loader.load_variable_long("stflife")
+
+        assert set(long_df["year"].unique()) == {2002}
+
+    def test_resolves_year_per_row_when_rounds_use_different_year_columns(
+        self, fake_ess_two_rounds, tmp_path
+    ):
+        """Regression test: a merged local CSV stacking multiple ESS rounds
+        can have early rounds populate only ``inwyr`` and later rounds only
+        populate ``inwyys``. Picking a single year column for the whole file
+        used to silently drop every row from whichever round didn't
+        populate that column."""
+        early_round = fake_ess_two_rounds._round_data["10.1/ess1"].copy()
+        early_round["inwyys"] = np.nan
+        early_round["inwyr"] = 2002
+        later_round = fake_ess_two_rounds._round_data["10.1/ess2"].copy()
+        later_round["inwyr"] = np.nan
+        merged = pd.concat([early_round, later_round], ignore_index=True)
+        path = tmp_path / "ess.csv"
+        merged.to_csv(path, index=False)
+        loader = EssDataLoader(fake_ess_two_rounds, local_csv_path=path)
+
+        long_df = loader.load_variable_long("stflife")
+
+        assert len(long_df) == 160
+        assert set(long_df["year"].unique()) == {2002, 2004}
+        assert loader.round_reports[0].year_column == "inwyys+inwyr"
+
+    def test_resolves_weight_per_row_when_rounds_use_different_weight_columns(
+        self, fake_ess_two_rounds, tmp_path
+    ):
+        """Regression test: a merged local CSV stacking multiple ESS rounds
+        can have some rounds missing ``anweight`` entirely (only
+        ``pspwght``/``dweight`` populated). Picking a single weight column
+        for the whole file used to turn every row from such a round into an
+        unusable (NaN-weighted, thus dropped) observation."""
+        with_anweight = fake_ess_two_rounds._round_data["10.1/ess1"].copy()
+        without_anweight = fake_ess_two_rounds._round_data["10.1/ess2"].copy()
+        without_anweight["pspwght"] = without_anweight["anweight"]
+        without_anweight = without_anweight.drop(columns=["anweight"])
+        merged = pd.concat([with_anweight, without_anweight], ignore_index=True)
+        path = tmp_path / "ess.csv"
+        merged.to_csv(path, index=False)
+        loader = EssDataLoader(fake_ess_two_rounds, local_csv_path=path)
+
+        long_df = loader.load_variable_long("stflife")
+
+        assert len(long_df) == 160
+        assert not long_df["weight"].isna().any()
+        assert loader.round_reports[0].weight_column == "anweight+pspwght"
+
     def test_round_filter_requires_essround_column(self, fake_ess_two_rounds, tmp_path):
         path = tmp_path / "ess.csv"
         fake_ess_two_rounds._round_data["10.1/ess1"].drop(columns=["essround"]).to_csv(

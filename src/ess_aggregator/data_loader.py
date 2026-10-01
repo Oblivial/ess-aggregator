@@ -157,52 +157,115 @@ class EssDataLoader:
 
     # -- weight / year column resolution -----------------------------------
     def _resolve_weight(self, df: pd.DataFrame) -> tuple[pd.Series, str]:
-        """Pick the best available weight column.
+        """Pick the best available weight for each row, coalescing across
+        candidate columns.
 
         Prefers ``anweight`` (pre-combined design + population-size weight -
         see README.md "Gewichtung" for why this is safe to use for both
-        single-country and pooled cross-country statistics). Falls back to
-        deriving it as ``dweight_or_pspwght * pweight`` if only the raw
-        components are present, then to an unweighted design weight, and
-        finally to equal weights (1.0) with a loud warning - equal weights
-        silently make every downstream statistic an *unweighted* one, which
-        is why this is logged as a warning rather than happening quietly.
+        single-country and pooled cross-country statistics), falling back to
+        ``pspwght``/``dweight`` (standalone design weight, no population
+        scaling). A single merged local CSV can stack several ESS rounds that
+        each only populate a different one of these columns (e.g. ``anweight``
+        is entirely absent for some early rounds) - picking one column for the
+        whole dataframe would silently turn every row from such a round into
+        an unusable (NaN-weighted) observation, so each row instead falls
+        back, in ``self.weight_candidates`` order, to the first candidate
+        column that has a value for *that row*. Rows still unresolved after
+        that are derived as ``dweight_or_pspwght * pweight`` if the raw
+        components are present, and finally fall back to equal weights (1.0)
+        with a loud warning - equal weights silently make every downstream
+        statistic an *unweighted* one, which is why this is logged as a
+        warning rather than happening quietly.
         """
+        weight = pd.Series(np.nan, index=df.index, dtype="float64")
+        used_candidates: list[str] = []
         for candidate in self.weight_candidates:
-            if candidate in df.columns:
-                return df[candidate].astype(float), candidate
+            if candidate not in df.columns:
+                continue
+            used_candidates.append(candidate)
+            weight = weight.where(weight.notna(), df[candidate].astype(float))
 
         design_weight_col = next(
             (c for c in ("pspwght", "dweight") if c in df.columns), None
         )
-        if design_weight_col is not None and POPULATION_WEIGHT_CANDIDATE in df.columns:
+        if weight.isna().any() and (
+            design_weight_col is not None and POPULATION_WEIGHT_CANDIDATE in df.columns
+        ):
             derived = df[design_weight_col].astype(float) * df[POPULATION_WEIGHT_CANDIDATE].astype(
                 float
             )
             derived_name = f"{design_weight_col}*{POPULATION_WEIGHT_CANDIDATE}"
-            logger.warning(
-                "No pre-combined weight column found; derived %s from its components.",
-                derived_name,
-            )
-            return derived, derived_name
+            if weight.isna().all():
+                logger.warning(
+                    "No pre-combined weight column found; derived %s from its components.",
+                    derived_name,
+                )
+            weight = weight.where(weight.notna(), derived)
+            used_candidates.append(derived_name)
 
-        logger.warning(
-            "No ESS design-weight column found (looked for %s); falling back to unweighted "
-            "(weight=1.0) analysis. Results will not correct for sampling design.",
-            self.weight_candidates,
-        )
-        return pd.Series(1.0, index=df.index), "none (unweighted)"
+        if weight.isna().any():
+            logger.warning(
+                "No ESS design-weight column found for %d row(s) (looked for %s); falling "
+                "back to unweighted (weight=1.0) for those rows. Results will not correct "
+                "for sampling design there.",
+                int(weight.isna().sum()),
+                self.weight_candidates,
+            )
+            weight = weight.fillna(1.0)
+            used_candidates.append("none (unweighted)")
+
+        if not used_candidates:
+            return weight, "none (unweighted)"
+        return weight, "+".join(dict.fromkeys(used_candidates))
+
+    def _missing_codes_for(self, column: str) -> set[float]:
+        """Numeric designated-missing codes (e.g. ``9999``) registered in the
+        codebook for ``column``, if any (see ``Variable.missing_values``)."""
+        variable = self.ess.codebook.get_variable(column)
+        if variable is None:
+            return set()
+        codes: set[float] = set()
+        for code in variable.missing_values:
+            try:
+                codes.add(float(code))
+            except (TypeError, ValueError):
+                continue
+        return codes
 
     def _resolve_year(self, df: pd.DataFrame) -> tuple[pd.Series, str | None]:
+        """Resolve each row's interview year, coalescing across candidate columns.
+
+        A single merged local CSV can stack several ESS rounds that each only
+        populate a different one of the candidate columns (e.g. early rounds
+        use ``inwyr`` while later ones use ``inwyys``). Picking a single
+        column for the whole dataframe would silently drop every row whose
+        round doesn't populate that column, so instead each row falls back,
+        in ``self.year_candidates`` order, to the first candidate column that
+        has a value for *that row*. Each candidate's own designated-missing
+        codes (e.g. ESS uses ``9999`` for "not applicable"/"not available"
+        across all three year columns) are recoded to NaN first, so a round
+        that lacks one candidate doesn't poison another round's rows with a
+        bogus sentinel "year".
+        """
+        year = pd.Series(np.nan, index=df.index, dtype="float64")
+        used_candidates: list[str] = []
         for candidate in self.year_candidates:
-            if candidate in df.columns:
-                return pd.to_numeric(df[candidate], errors="coerce"), candidate
-        logger.warning(
-            "No interview-year column found (looked for %s); year-level aggregation is "
-            "unavailable for this round.",
-            self.year_candidates,
-        )
-        return pd.Series(np.nan, index=df.index), None
+            if candidate not in df.columns:
+                continue
+            used_candidates.append(candidate)
+            candidate_values = pd.to_numeric(df[candidate], errors="coerce")
+            candidate_values = candidate_values.mask(
+                candidate_values.isin(self._missing_codes_for(candidate))
+            )
+            year = year.where(year.notna(), candidate_values)
+        if not used_candidates:
+            logger.warning(
+                "No interview-year column found (looked for %s); year-level aggregation is "
+                "unavailable for this round.",
+                self.year_candidates,
+            )
+            return year, None
+        return year, "+".join(used_candidates)
 
     def _decode_country(self, df: pd.DataFrame) -> pd.Series:
         country_variable = self.ess.codebook.get_variable(COUNTRY_COLUMN)
